@@ -271,8 +271,14 @@ function C_long = loadSecondPeriodWideAsLong(dataFile, secSheet, targetCountyHea
     end
     out = table([],[],[],[],[], 'VariableNames',{'date','county','cases','deaths','population'});
 
+    fprintf('Target county headers to find:\n');
+    for i = 1:numel(targetCountyHeaders)
+        fprintf('  %d: %s\n', i, targetCountyHeaders{i});
+    end
+    
     for i = 1:numel(targetCountyHeaders)
         cty = targetCountyHeaders{i};
+        fprintf('\nProcessing county: %s\n', cty);
         j_cases = 0;
         
         % 정확한 매칭 시도
@@ -301,11 +307,14 @@ function C_long = loadSecondPeriodWideAsLong(dataFile, secSheet, targetCountyHea
         
         if isempty(j_cases) || j_cases == 0
             % 모든 컬럼 이름을 출력하여 디버깅 도움
+            fprintf('ERROR: County column "%s" not found in Second Period sheet.\n', cty);
             fprintf('Available columns in Second Period sheet:\n');
             for k = 1:length(data.Properties.VariableNames)
                 fprintf('  %d: %s\n', k, data.Properties.VariableNames{k});
             end
             error('County column "%s" not found in Second Period sheet. Please check the column names above.', cty);
+        else
+            fprintf('  Found county column at index %d: %s\n', j_cases, data.Properties.VariableNames{j_cases});
         end
         
         % Cases, Deaths, Population 컬럼 인덱스 계산
@@ -350,6 +359,23 @@ function C_long = loadSecondPeriodWideAsLong(dataFile, secSheet, targetCountyHea
         out = [out; tmp]; %#ok<AGROW>
     end
     C_long = sortrows(out, {'county','date'});
+    
+    % 결과 검증
+    if isempty(C_long)
+        fprintf('ERROR: No data extracted from Second Period sheet.\n');
+        fprintf('Target county headers: %s\n', strjoin(targetCountyHeaders, ', '));
+        fprintf('Available columns in the sheet:\n');
+        for i = 1:length(data.Properties.VariableNames)
+            fprintf('  %d: %s\n', i, data.Properties.VariableNames{i});
+        end
+        error('No county data extracted. Check sheet structure and county names.');
+    else
+        fprintf('Successfully extracted data for %d counties:\n', length(unique(C_long.county)));
+        for i = 1:length(unique(C_long.county))
+            county = unique(C_long.county);
+            fprintf('  - %s (%d rows)\n', county{i}, sum(strcmp(C_long.county, county{i})));
+        end
+    end
 end
 
 function V = loadVaccinationDailyByCounty(vaxFile, countyKey)
