@@ -185,15 +185,23 @@ disp(results);
 
 function [secSheet, sheetNames] = pickSecondPeriodSheet(dataFile)
     [~,sheetNames] = xlsfinfo(dataFile);
+    fprintf('Available sheets in %s:\n', dataFile);
+    for i = 1:length(sheetNames)
+        fprintf('  %d: %s\n', i, sheetNames{i});
+    end
+    
     secSheet = '';
     keys = ["second period","second","2nd"];
     for s = string(sheetNames)
         if any(contains(lower(s), keys))
-            secSheet = char(s); break;
+            secSheet = char(s); 
+            fprintf('Found matching sheet: %s\n', secSheet);
+            break;
         end
     end
     if isempty(secSheet)
         secSheet = 'Second Period'; % fallback
+        fprintf('Using fallback sheet name: %s\n', secSheet);
     end
 end
 
