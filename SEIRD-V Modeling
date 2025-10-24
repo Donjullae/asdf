@@ -1,0 +1,494 @@
+%% SEIRD-V Modeling for Second Period (COVID-19) — All-in-One Script
+% Author: ChatGPT (for 일롱머스크)
+% Files (Windows):
+%   C:\Users\user\Downloads\BIO518_DataPerPeriod.xlsx
+%   C:\Users\user\Downloads\Vaccination dataset.xlsx
+% Vaccination sheets: 'San Benito', 'Napa', 'Los Angeles'
+% DataPerPeriod 'Second Period' 시트는 wide 형태(가로로 카운티 블록)라고 가정
+
+clear; clc;
+
+%% -------------------- User Config --------------------
+dataFolder = 'C:\Users\user\Downloads';
+dataFile   = fullfile(dataFolder, 'BIO518_DataPerPeriod.xlsx');  % second period sheet 포함
+vaxFile    = fullfile(dataFolder, 'Vaccination dataset.xlsx');   % 시트: San Benito / Napa / Los Angeles
+
+% DataPerPeriod에 있는 카운티 표기(열 헤더)와 백신 시트 표기(탭 이름)를 정규화 매핑
+% 예: DataPerPeriod 헤더: 'San Benito, CA' 이고, 백신 파일 시트: 'San Benito'
+dpCountyHeaders = {'San Benito, CA','Napa, CA','Los Angeles, CA'};
+vaxCountySheets = {'San Benito','Napa','Los Angeles'};
+
+% Plot on/off
+makePlots = true;
+
+% 기간 설정 (PBL spec)
+periodStart = datetime(2020,10,1);
+periodEnd   = datetime(2021,3,31);
+
+%% -------------------- Load and Reshape Second Period (WIDE -> LONG) --------------------
+[secSheet, ~] = pickSecondPeriodSheet(dataFile);
+C_long = loadSecondPeriodWideAsLong(dataFile, secSheet, dpCountyHeaders);
+
+% 기간 필터
+C_long = C_long(C_long.date>=periodStart & C_long.date<=periodEnd, :);
+
+if isempty(C_long)
+    error('Second Period 데이터가 비어 있습니다. 시트명/기간을 확인하세요.');
+end
+
+%% -------------------- Load Vaccination data (robust) --------------------
+vaxData = struct();
+for i = 1:numel(vaxCountySheets)
+    ctyKey = vaxCountySheets{i};
+    V = loadVaccinationDailyByCounty(vaxFile, ctyKey);
+    vaxData.(matlabifyName(ctyKey)).date  = V.date;
+    vaxData.(matlabifyName(ctyKey)).daily = V.daily_doses;
+end
+
+%% -------------------- Modeling Loop per County --------------------
+results = struct();
+
+for i = 1:numel(dpCountyHeaders)
+    countyHeader = dpCountyHeaders{i};        % e.g., 'San Benito, CA'
+    vaxKey       = vaxCountySheets{i};        % e.g., 'San Benito'
+    disp(['===== County: ' countyHeader ' =====']);
+
+    % 해당 카운티 데이터 추출
+    C = C_long(strcmpi(C_long.county, countyHeader), :);
+    if isempty(C)
+        warning('No rows for %s in Second Period. Skipped.', countyHeader);
+        continue;
+    end
+    C = sortrows(C, 'date');
+
+    % 관측치 정규화(일일)
+    yCases  = ensureDaily(C.cases);    % 누적이면 diff해서 일일
+    yDeaths = ensureDaily(C.deaths);
+
+    % 인구 N
+    N = C.population( find(~isnan(C.population) & C.population>0, 1, 'last') );
+    if isempty(N) || isnan(N) || N<=0
+        N = estimatePopFromCases_struct(C, 'cases');
+    end
+
+    % 백신 정렬
+    Vx = vaxData.(matlabifyName(vaxKey));
+    vDailyAligned = alignDailyByDate(C.date, Vx.date, Vx.daily);
+    nu_t = vDailyAligned ./ N;    % S -> V 이동 비율
+    nu_t(nu_t<0) = 0;
+
+    % 시간 벡터 (t=1..T)
+    tData = days(C.date - C.date(1)) + 1;
+    Tlen  = numel(tData);
+
+    % 피팅/예측 분할 (첫 3개월)
+    fitEndDate = C.date(1) + calmonths(3) - days(1); % inclusive
+    fitIdx = C.date <= fitEndDate;
+    if ~any(fitIdx)
+        % 데이터가 부족하면 92일 사용(예비)
+        fitDays = min(Tlen, 92);
+        fitIdx = (1:fitDays)';
+    end
+    predIdx = ~fitIdx;
+
+    % 관측치 구조
+    obs.cases  = yCases(:);
+    obs.deaths = yDeaths(:);
+
+    % 초기조건 (E0, I0 추정, 나머지 0)
+    I0 = max(1, round(mean(obs.cases(max(1,find(fitIdx,1)):min(end,find(fitIdx,1)+6)))*5));
+    if isnan(I0) || I0<=0, I0 = 10; end
+    E0 = I0;
+    R0 = 0; D0 = 0; V0 = 0;
+    S0 = N - (E0 + I0 + R0 + D0 + V0);
+    S0 = max(S0, 100);
+    y0 = [S0; E0; I0; R0; D0; V0];
+
+    % 파라미터 초기/경계
+    % p = [beta, sigma, gamma, mu]
+    p0 = [0.30, 1/5.2, 1/7, 0.005];
+    lb = [0.01, 1/14, 1/21, 0.0001];
+    ub = [1.50, 1/3,  1/3,  0.02];
+
+    % 가중치
+    wCases = 1.0;
+    wDeaths= 2.0;
+
+    % -------- Approach A: 결정론 파라미터 피팅 --------
+    costfun = @(p) seirdv_residual(p, y0, nu_t, N, tData, obs, fitIdx, wCases, wDeaths);
+    pHat = [];
+    try
+        opts = optimoptions('lsqnonlin','Display','off','MaxFunctionEvaluations',3e4,'MaxIterations',2e3);
+        pHat = lsqnonlin(costfun, p0, lb, ub, opts);
+    catch
+        % Optimization Toolbox 없으면 fminsearch
+        warning('lsqnonlin 사용 불가. fminsearch로 대체(제곱오차 최소화).');
+        obj = @(p) sum(seirdv_residual(p, y0, nu_t, N, tData, obs, fitIdx, wCases, wDeaths).^2);
+        pHat = fminsearch(obj, p0, optimset('Display','off'));
+        pHat = max(lb, min(ub, pHat));
+    end
+
+    % 결정론 시뮬
+    [simDailyCases, simDailyDeaths, states] = simulate_seirdv(pHat, y0, nu_t, N, tData);
+
+    % 지표
+    [fitMetrics, predMetrics] = evaluateMetrics(obs, simDailyCases, simDailyDeaths, fitIdx, predIdx);
+    R0_est = pHat(1) / (pHat(3) + pHat(4));  % R0 ≈ beta / (gamma+mu)
+
+    % -------- Approach B: 확률적 검증(β 일일 잡음) --------
+    stoch.nRuns = 200;
+    stoch.betaNoiseSD = 0.15; % 15% 로그정규 잡음
+    [bands, ~] = stochastic_validate(pHat, y0, nu_t, N, tData, stoch);
+
+    % 결과 보관
+    key = matlabifyName(countyHeader);
+    results.(key).params = struct('beta',pHat(1),'sigma',pHat(2),'gamma',pHat(3),'mu',pHat(4),'R0',R0_est);
+    results.(key).metrics = struct('fit',fitMetrics,'pred',predMetrics);
+    results.(key).states  = states;
+    results.(key).sim     = struct('cases',simDailyCases,'deaths',simDailyDeaths);
+    results.(key).bands   = bands;
+    results.(key).dates   = C.date;
+
+    % -------- Plot --------
+    if makePlots
+        figure('Name',[countyHeader ' — Daily Cases/Deaths'],'Color','w');
+        tiledlayout(2,1,'Padding','compact','TileSpacing','compact');
+
+        % Cases
+        nexttile; hold on; grid on;
+        plot(C.date, obs.cases, '-', 'LineWidth',1.2);
+        plot(C.date, simDailyCases, '--', 'LineWidth',1.2);
+        if ~isempty(bands)
+            fill_between(C.date, bands.cases.lo, bands.cases.hi, [0.85 0.85 1.0]);
+        end
+        xline(C.date(find(fitIdx,1,'last'))+1,':k','Fit/Forecast Split');
+        title(sprintf('%s — Daily Cases (RMSE fit=%.1f, pred=%.1f)', countyHeader, fitMetrics.cases.RMSE, predMetrics.cases.RMSE));
+        legend('Observed','Deterministic','Stochastic band','Location','best');
+
+        % Deaths
+        nexttile; hold on; grid on;
+        plot(C.date, obs.deaths, '-', 'LineWidth',1.2);
+        plot(C.date, simDailyDeaths, '--', 'LineWidth',1.2);
+        if ~isempty(bands)
+            fill_between(C.date, bands.deaths.lo, bands.deaths.hi, [1.0 0.85 0.85]);
+        end
+        xline(C.date(find(fitIdx,1,'last'))+1,':k','Fit/Forecast Split');
+        title(sprintf('%s — Daily Deaths (RMSE fit=%.2f, pred=%.2f)', countyHeader, fitMetrics.deaths.RMSE, predMetrics.deaths.RMSE));
+        legend('Observed','Deterministic','Stochastic band','Location','best');
+    end
+end
+
+disp('--- Parameter & Metric Summary ---');
+disp(results);
+
+%% ===================== Helper Functions =====================
+
+function [secSheet, sheetNames] = pickSecondPeriodSheet(dataFile)
+    [~,sheetNames] = xlsfinfo(dataFile);
+    secSheet = '';
+    keys = ["second period","second","2nd"];
+    for s = string(sheetNames)
+        if any(contains(lower(s), keys))
+            secSheet = char(s); break;
+        end
+    end
+    if isempty(secSheet)
+        secSheet = 'Second Period'; % fallback
+    end
+end
+
+function C_long = loadSecondPeriodWideAsLong(dataFile, secSheet, targetCountyHeaders)
+    raw = readtable(dataFile,'Sheet',secSheet,'PreserveVariableNames',true);
+    if ~ismember('Date', raw.Properties.VariableNames)
+        error('Second Period sheet must have a "Date" column in the first column.');
+    end
+    % 첫 행을 서브헤더로 사용 (Cases/Deaths/Population 가 들어있다고 가정)
+    subhdr = raw(1,:);
+    data   = raw(2:end,:);
+    % 날짜 정규화
+    if ~isdatetime(data.Date)
+        try data.Date = datetime(data.Date,'ConvertFrom','excel'); catch, data.Date = datetime(data.Date); end
+    end
+    out = table([],[],[],[],[], 'VariableNames',{'date','county','cases','deaths','population'});
+
+    for i = 1:numel(targetCountyHeaders)
+        cty = targetCountyHeaders{i};
+        if ~ismember(cty, data.Properties.VariableNames)
+            % 일부 파일은 헤더에 공백/쉼표 등 변형이 있을 수 있음 → 느슨한 탐색
+            j_cases = find(contains(string(data.Properties.VariableNames), erase(cty,' '),'IgnoreCase',true),1);
+            if isempty(j_cases)
+                error('County column "%s" not found in Second Period sheet.', cty);
+            end
+        else
+            j_cases = find(strcmp(data.Properties.VariableNames, cty),1);
+        end
+        j_deaths = j_cases + 1; j_pop = j_cases + 2;
+
+        % 서브헤더 검증(가능하면)
+        sh_cases = lower(string(subhdr{1, j_cases}));
+        sh_death = lower(string(subhdr{1, j_deaths}));
+        sh_pop   = lower(string(subhdr{1, j_pop}));
+        if ~(contains(sh_cases,"case") && contains(sh_death,"death") && contains(sh_pop,"pop"))
+            % 일부 파일에서 첫 행이 비어있을 수도 있으므로 경고만
+            warning('Subheader check skipped/loose for county block: %s', cty);
+        end
+
+        tmp = table();
+        tmp.date       = data.Date;
+        tmp.county     = repmat({cty}, height(data), 1);
+        tmp.cases      = double(data{:, j_cases});
+        tmp.deaths     = double(data{:, j_deaths});
+        tmp.population = double(data{:, j_pop});
+
+        % NaN/비어있는 population forward-fill
+        for r=2:height(tmp)
+            if isnan(tmp.population(r)) || tmp.population(r)==0
+                tmp.population(r) = tmp.population(r-1);
+            end
+        end
+        if all(isnan(tmp.population) | tmp.population==0)
+            est = max(5*nanmax(tmp.cases), nanmax(tmp.cases)/0.2);
+            if isempty(est) || isnan(est) || est<=0, est = 1e5; end
+            tmp.population(:) = est;
+        end
+        tmp.cases(isnan(tmp.cases))   = 0;
+        tmp.deaths(isnan(tmp.deaths)) = 0;
+
+        out = [out; tmp]; %#ok<AGROW>
+    end
+    C_long = sortrows(out, {'county','date'});
+end
+
+function V = loadVaccinationDailyByCounty(vaxFile, countyKey)
+    [~, sheets] = xlsfinfo(vaxFile);
+    target = '';
+    % 시트명 대소문자/공백 무시 매칭
+    for s = string(sheets)
+        if strcmpi(strtrim(s), strtrim(countyKey)) ...
+           || contains(lower(strtrim(s)), lower(strrep(countyKey,' ','')))
+            target = char(s); break;
+        end
+    end
+    if isempty(target)
+        error('Vaccination sheet for "%s" not found.', countyKey);
+    end
+
+    T = readtable(vaxFile,'Sheet',target);
+    T = standardizeVarNames(T);
+
+    % 날짜 컬럼
+    if ismember('administered_date', T.Properties.VariableNames)
+        d = T.administered_date;
+    elseif ismember('date', T.Properties.VariableNames)
+        d = T.date;
+    else
+        error('Vaccination sheet "%s" must have date/administered_date', target);
+    end
+    if ~isdatetime(d)
+        try d = datetime(d,'ConvertFrom','excel'); catch, d = datetime(d); end
+    end
+
+    % 일일/누적 열 식별
+    colDaily = pickCol(T, {'total_doses','vaccinated_daily','daily_doses'});
+    colCum   = pickCol(T, {'cumulative_total_doses','cumulative_doses','vaccinated_cumulative'});
+    if ~isempty(colDaily)
+        daily = double(T.(colDaily));
+    elseif ~isempty(colCum)
+        cum   = double(T.(colCum));
+        daily = [cum(1); diff(cum)];
+    else
+        % 부분/완전 접종 누적 합으로 대체
+        pCum = pickCol(T, {'cumulative_partially_vaccinated','total_partially_vaccinated','partially_vaccinated'});
+        fCum = pickCol(T, {'cumulative_fully_vaccinated','fully_vaccinated'});
+        if isempty(pCum) && isempty(fCum)
+            error('Vaccination sheet "%s": cannot find dose columns.', target);
+        end
+        p = zeros(height(T),1); f = zeros(height(T),1);
+        if ~isempty(pCum), p = double(T.(pCum)); end
+        if ~isempty(fCum), f = double(T.(fCum)); end
+        daily = [p(1)+f(1); diff(p+f)];
+    end
+    daily(daily<0) = 0;
+
+    V = table();
+    V.date = d(:);
+    V.daily_doses = daily(:);
+end
+
+function T = standardizeVarNames(T)
+    vn = lower(string(T.Properties.VariableNames));
+    vn = regexprep(vn,'\s+','_');
+    vn = regexprep(vn,'[^a-z0-9_]+','');
+    T.Properties.VariableNames = cellstr(vn);
+end
+
+function name = pickCol(T, candidates)
+    name = '';
+    for k=1:numel(candidates)
+        c = lower(candidates{k});
+        if ismember(c, T.Properties.VariableNames)
+            name = c; return;
+        end
+        idx = find(contains(T.Properties.VariableNames, c),1);
+        if ~isempty(idx)
+            name = T.Properties.VariableNames{idx}; return;
+        end
+    end
+end
+
+function arr = ensureDaily(x)
+    x = x(:);
+    if all(diff(x)>=-1e-6) % 누적
+        arr = [x(1); diff(x)];
+    else
+        arr = x; % 이미 일일
+    end
+    arr(arr<0) = 0;
+end
+
+function N = estimatePopFromCases_struct(C, casesCol)
+    x = C.(casesCol); x = x(:);
+    if all(diff(x)>=-1e-6)
+        total = x(end);
+    else
+        total = sum(ensureDaily(x));
+    end
+    N = max(5*total, total/0.2);
+end
+
+function key = matlabifyName(s)
+    key = regexprep(lower(s),'[^a-z0-9]+','_');
+end
+
+function v = alignDailyByDate(refDates, srcDates, srcDaily)
+    v = zeros(numel(refDates),1);
+    [~, ia, ib] = intersect(refDates, srcDates);
+    v(ia) = srcDaily(ib);
+end
+
+function r = seirdv_residual(p, y0, nu_t, N, tData, obs, fitIdx, wCases, wDeaths)
+    [simCases, simDeaths] = simulate_seirdv(p, y0, nu_t, N, tData);
+    eCases  = (simCases(fitIdx)  - obs.cases(fitIdx));
+    eDeaths = (simDeaths(fitIdx) - obs.deaths(fitIdx));
+    r = [sqrt(wCases)*eCases; sqrt(wDeaths)*eDeaths];
+    r(isnan(r) | isinf(r)) = 0;
+end
+
+function [dailyCases, dailyDeaths, states] = simulate_seirdv(p, y0, nu_t, N, tData)
+    % p = [beta, sigma, gamma, mu]
+    beta = p(1); sigma = p(2); gamma = p(3); mu = p(4);
+    Tlen = numel(tData);
+    states = zeros(Tlen, 6);
+    y = y0(:)'; states(1,:) = y;
+    dailyCases  = zeros(Tlen,1);
+    dailyDeaths = zeros(Tlen,1);
+
+    for t = 2:Tlen
+        S = y(1); E = y(2); I = y(3); R = y(4); D = y(5); V = y(6);
+        nu = nu_t(t-1);
+        newInf   = beta * S * I / N;   % S->E
+        exp2inf  = sigma * E;          % E->I
+        recov    = gamma * I;          % I->R
+        deaths   = mu    * I;          % I->D
+        vacc     = nu    * S;          % S->V
+
+        S2 = S - newInf - vacc;
+        E2 = E + newInf - exp2inf;
+        I2 = I + exp2inf - recov - deaths;
+        R2 = R + recov;
+        D2 = D + deaths;
+        V2 = V + vacc;
+
+        y = [S2 E2 I2 R2 D2 V2]; y(y<0)=0;
+        states(t,:) = y;
+
+        dailyCases(t)  = exp2inf;
+        dailyDeaths(t) = deaths;
+    end
+    dailyCases(1)  = sigma * y0(2);
+    dailyDeaths(1) = mu    * y0(3);
+end
+
+function [fitMetrics, predMetrics] = evaluateMetrics(obs, simCases, simDeaths, fitIdx, predIdx)
+    fitMetrics   = struct();
+    predMetrics  = struct();
+    fitMetrics.cases   = basicMetrics(obs.cases(fitIdx),  simCases(fitIdx));
+    fitMetrics.deaths  = basicMetrics(obs.deaths(fitIdx), simDeaths(fitIdx));
+    predMetrics.cases  = basicMetrics(obs.cases(predIdx),  simCases(predIdx));
+    predMetrics.deaths = basicMetrics(obs.deaths(predIdx), simDeaths(predIdx));
+end
+
+function m = basicMetrics(y, yhat)
+    y = y(:); yhat = yhat(:);
+    e = yhat - y;
+    m.RMSE = sqrt(mean(e.^2,'omitnan'));
+    m.MAE  = mean(abs(e),'omitnan');
+    if any(y>0)
+        m.MAPE = mean(abs(e)./max(y,1),'omitnan');
+    else
+        m.MAPE = NaN;
+    end
+end
+
+function [bands, sims] = stochastic_validate(p, y0, nu_t, N, tData, stoch)
+    n = stoch.nRuns;
+    s = stoch.betaNoiseSD;
+    Tlen = numel(tData);
+    sims.cases  = zeros(Tlen, n);
+    sims.deaths = zeros(Tlen, n);
+
+    for k=1:n
+        betaNoise = exp(s*randn(Tlen,1) - 0.5*s^2); % E[mult]=1
+        [cases, deaths] = simulate_seirdv_betaNoise(p, y0, nu_t, N, tData, betaNoise);
+        sims.cases(:,k)  = cases;
+        sims.deaths(:,k) = deaths;
+    end
+
+    bands.cases.lo  = prctile(sims.cases, 10, 2);
+    bands.cases.hi  = prctile(sims.cases, 90, 2);
+    bands.deaths.lo = prctile(sims.deaths,10, 2);
+    bands.deaths.hi = prctile(sims.deaths,90, 2);
+end
+
+function [dailyCases, dailyDeaths] = simulate_seirdv_betaNoise(p, y0, nu_t, N, tData, betaNoise)
+    beta = p(1); sigma = p(2); gamma = p(3); mu = p(4);
+    Tlen = numel(tData);
+    y = y0(:)';
+
+    dailyCases  = zeros(Tlen,1);
+    dailyDeaths = zeros(Tlen,1);
+
+    for t = 2:Tlen
+        S = y(1); E = y(2); I = y(3); R = y(4); D = y(5); V = y(6);
+        nu   = nu_t(t-1);
+        bt   = beta * betaNoise(t-1);
+
+        newInf   = bt * S * I / N;
+        exp2inf  = sigma * E;
+        recov    = gamma * I;
+        deaths   = mu    * I;
+        vacc     = nu    * S;
+
+        S2 = S - newInf - vacc;
+        E2 = E + newInf - exp2inf;
+        I2 = I + exp2inf - recov - deaths;
+        R2 = R + recov;
+        D2 = D + deaths;
+        V2 = V + vacc;
+
+        y = [S2 E2 I2 R2 D2 V2]; y(y<0)=0;
+
+        dailyCases(t)  = exp2inf;
+        dailyDeaths(t) = deaths;
+    end
+    dailyCases(1)  = sigma * y0(2);
+    dailyDeaths(1) = mu    * y0(3);
+end
+
+function fill_between(x, lo, hi, rgb)
+    lo = lo(:)'; hi = hi(:)'; x = x(:)';
+    X = [x, fliplr(x)];
+    Y = [lo, fliplr(hi)];
+    p = patch('XData',X,'YData',Y,'FaceColor',rgb,'EdgeColor','none','FaceAlpha',0.35);
+    uistack(p,'bottom');
+end
