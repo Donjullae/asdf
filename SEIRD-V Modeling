@@ -185,22 +185,82 @@ disp(results);
 
 function [secSheet, sheetNames] = pickSecondPeriodSheet(dataFile)
     [~,sheetNames] = xlsfinfo(dataFile);
+    fprintf('Available sheets in %s:\n', dataFile);
+    for i = 1:length(sheetNames)
+        fprintf('  %d: %s\n', i, sheetNames{i});
+    end
+    
     secSheet = '';
     keys = ["second period","second","2nd"];
     for s = string(sheetNames)
         if any(contains(lower(s), keys))
-            secSheet = char(s); break;
+            secSheet = char(s); 
+            fprintf('Found matching sheet: %s\n', secSheet);
+            break;
         end
     end
     if isempty(secSheet)
         secSheet = 'Second Period'; % fallback
+        fprintf('Using fallback sheet name: %s\n', secSheet);
     end
 end
 
 function C_long = loadSecondPeriodWideAsLong(dataFile, secSheet, targetCountyHeaders)
+    % 디버깅 정보 출력
+    fprintf('Loading Second Period data from sheet: %s\n', secSheet);
+    
     raw = readtable(dataFile,'Sheet',secSheet,'PreserveVariableNames',true);
-    if ~ismember('Date', raw.Properties.VariableNames)
-        error('Second Period sheet must have a "Date" column in the first column.');
+    
+    % 시트 구조 정보 출력
+    fprintf('Sheet dimensions: %d rows x %d columns\n', height(raw), width(raw));
+    fprintf('Column names:\n');
+    for i = 1:min(10, width(raw))  % 처음 10개 컬럼만 출력
+        fprintf('  %d: %s\n', i, raw.Properties.VariableNames{i});
+    end
+    if width(raw) > 10
+        fprintf('  ... and %d more columns\n', width(raw) - 10);
+    end
+    
+    % Date 컬럼을 더 유연하게 찾기
+    dateColName = '';
+    dateColIdx = 0;
+    
+    % 가능한 Date 컬럼 이름들
+    dateCandidates = {'Date', 'date', 'DATE', 'Date_', 'date_', 'Date__', 'date__'};
+    
+    % 정확한 매칭 시도
+    for i = 1:length(dateCandidates)
+        if ismember(dateCandidates{i}, raw.Properties.VariableNames)
+            dateColName = dateCandidates{i};
+            dateColIdx = find(strcmp(raw.Properties.VariableNames, dateColName));
+            break;
+        end
+    end
+    
+    % 정확한 매칭이 실패하면 부분 매칭 시도
+    if isempty(dateColName)
+        for i = 1:length(raw.Properties.VariableNames)
+            colName = lower(raw.Properties.VariableNames{i});
+            if contains(colName, 'date') || contains(colName, 'time')
+                dateColName = raw.Properties.VariableNames{i};
+                dateColIdx = i;
+                break;
+            end
+        end
+    end
+    
+    % 여전히 찾지 못했다면 첫 번째 컬럼을 Date로 가정
+    if isempty(dateColName)
+        dateColName = raw.Properties.VariableNames{1};
+        dateColIdx = 1;
+        warning('Date column not found. Using first column "%s" as date column.', dateColName);
+    end
+    
+    % Date 컬럼을 첫 번째 위치로 이동
+    if dateColIdx ~= 1
+        raw = [raw(:, dateColIdx), raw(:, [1:dateColIdx-1, dateColIdx+1:end])];
+        raw.Properties.VariableNames{1} = 'Date';
+        warning('Moved date column "%s" to first position and renamed to "Date".', dateColName);
     end
     % 첫 행을 서브헤더로 사용 (Cases/Deaths/Population 가 들어있다고 가정)
     subhdr = raw(1,:);
@@ -211,18 +271,60 @@ function C_long = loadSecondPeriodWideAsLong(dataFile, secSheet, targetCountyHea
     end
     out = table([],[],[],[],[], 'VariableNames',{'date','county','cases','deaths','population'});
 
+    fprintf('Target county headers to find:\n');
+    for i = 1:numel(targetCountyHeaders)
+        fprintf('  %d: %s\n', i, targetCountyHeaders{i});
+    end
+    
     for i = 1:numel(targetCountyHeaders)
         cty = targetCountyHeaders{i};
-        if ~ismember(cty, data.Properties.VariableNames)
-            % 일부 파일은 헤더에 공백/쉼표 등 변형이 있을 수 있음 → 느슨한 탐색
-            j_cases = find(contains(string(data.Properties.VariableNames), erase(cty,' '),'IgnoreCase',true),1);
-            if isempty(j_cases)
-                error('County column "%s" not found in Second Period sheet.', cty);
-            end
-        else
+        fprintf('\nProcessing county: %s\n', cty);
+        j_cases = 0;
+        
+        % 정확한 매칭 시도
+        if ismember(cty, data.Properties.VariableNames)
             j_cases = find(strcmp(data.Properties.VariableNames, cty),1);
+        else
+            % 느슨한 매칭 시도 - 여러 패턴으로 시도
+            patterns = {
+                cty,  % 원본
+                erase(cty, ' '),  % 공백 제거
+                erase(cty, ','),  % 쉼표 제거
+                erase(erase(cty, ' '), ','),  % 공백과 쉼표 제거
+                strrep(cty, ', CA', ''),  % , CA 제거
+                strrep(strrep(cty, ', CA', ''), ' ', ''),  % , CA와 공백 제거
+                lower(cty),  % 소문자
+                upper(cty)   % 대문자
+            };
+            
+            for p = 1:length(patterns)
+                j_cases = find(contains(string(data.Properties.VariableNames), patterns{p}, 'IgnoreCase', true), 1);
+                if ~isempty(j_cases)
+                    break;
+                end
+            end
         end
-        j_deaths = j_cases + 1; j_pop = j_cases + 2;
+        
+        if isempty(j_cases) || j_cases == 0
+            % 모든 컬럼 이름을 출력하여 디버깅 도움
+            fprintf('ERROR: County column "%s" not found in Second Period sheet.\n', cty);
+            fprintf('Available columns in Second Period sheet:\n');
+            for k = 1:length(data.Properties.VariableNames)
+                fprintf('  %d: %s\n', k, data.Properties.VariableNames{k});
+            end
+            error('County column "%s" not found in Second Period sheet. Please check the column names above.', cty);
+        else
+            fprintf('  Found county column at index %d: %s\n', j_cases, data.Properties.VariableNames{j_cases});
+        end
+        
+        % Cases, Deaths, Population 컬럼 인덱스 계산
+        j_deaths = j_cases + 1; 
+        j_pop = j_cases + 2;
+        
+        % 컬럼 인덱스가 범위를 벗어나는지 확인
+        if j_deaths > width(data) || j_pop > width(data)
+            error('Insufficient columns for county "%s". Expected at least %d columns starting from column %d.', cty, j_pop, j_cases);
+        end
 
         % 서브헤더 검증(가능하면)
         sh_cases = lower(string(subhdr{1, j_cases}));
@@ -257,6 +359,23 @@ function C_long = loadSecondPeriodWideAsLong(dataFile, secSheet, targetCountyHea
         out = [out; tmp]; %#ok<AGROW>
     end
     C_long = sortrows(out, {'county','date'});
+    
+    % 결과 검증
+    if isempty(C_long)
+        fprintf('ERROR: No data extracted from Second Period sheet.\n');
+        fprintf('Target county headers: %s\n', strjoin(targetCountyHeaders, ', '));
+        fprintf('Available columns in the sheet:\n');
+        for i = 1:length(data.Properties.VariableNames)
+            fprintf('  %d: %s\n', i, data.Properties.VariableNames{i});
+        end
+        error('No county data extracted. Check sheet structure and county names.');
+    else
+        fprintf('Successfully extracted data for %d counties:\n', length(unique(C_long.county)));
+        for i = 1:length(unique(C_long.county))
+            county = unique(C_long.county);
+            fprintf('  - %s (%d rows)\n', county{i}, sum(strcmp(C_long.county, county{i})));
+        end
+    end
 end
 
 function V = loadVaccinationDailyByCounty(vaxFile, countyKey)
